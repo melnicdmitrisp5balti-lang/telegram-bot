@@ -7,11 +7,11 @@ import os
 import base64
 import time
 import re
-import asyncio
-import asyncpg
+import sqlite3
 from datetime import datetime, timedelta
+import json
 
-# ========== НАСТРОЙКИ (из переменных окружения) ==========
+# ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set!")
@@ -19,238 +19,203 @@ if not BOT_TOKEN:
 BOT_USERNAME = os.environ.get('BOT_USERNAME', 'genphototikbot')
 MAX_USES = int(os.environ.get('MAX_USES', 3))
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 957881887))
-DATABASE_URL = os.environ.get('DATABASE_URL')
 
 print("="*50)
 print(f"🤖 Бот: @{BOT_USERNAME}")
 print(f"👑 Админ ID: {ADMIN_ID}")
-print(f"🗄️ DATABASE_URL: {'✅ ЕСТЬ' if DATABASE_URL else '❌ НЕТ!'}")
 print("="*50)
 # ================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# Глобальные переменные для пула соединений
-db_pool = None
+# ========== РАБОТА С SQLite ==========
+DB_PATH = '/tmp/bot_data.db'  # Render сохраняет /tmp
 
-# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
-async def init_db():
-    global db_pool
-    if not DATABASE_URL:
-        print("❌ DATABASE_URL не задан!")
-        return False
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
     
-    try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        
-        async with db_pool.acquire() as conn:
-            # Таблица пользователей
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    is_allowed BOOLEAN DEFAULT FALSE,
-                    is_banned BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица ссылок
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS links (
-                    code TEXT PRIMARY KEY,
-                    owner_id BIGINT,
-                    uses INTEGER DEFAULT 0,
-                    max_uses INTEGER DEFAULT 3,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            ''')
-            
-            # Таблица запросов доступа
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS access_requests (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Таблица забаненных
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS banned_users (
-                    user_id BIGINT PRIMARY KEY,
-                    reason TEXT,
-                    banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-        
-        print("✅ База данных инициализирована!")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка инициализации БД: {e}")
-        return False
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_allowed INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY,
+            owner_id INTEGER,
+            uses INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 3,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS access_requests (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("✅ SQLite база данных инициализирована")
 
-def run_async(coro):
-    """Запуск асинхронной функции из синхронного кода"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
-
-async def get_user_async(user_id):
-    if not db_pool:
-        return None
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow('SELECT * FROM users WHERE user_id = $1', user_id)
-
-async def add_user_async(user_id, username):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO users (user_id, username) 
-            VALUES ($1, $2) 
-            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-        ''', user_id, username)
-
-async def allow_user_async(user_id):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('UPDATE users SET is_allowed = TRUE WHERE user_id = $1', user_id)
-
-async def deny_user_async(user_id):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('UPDATE users SET is_allowed = FALSE WHERE user_id = $1', user_id)
-
-async def ban_user_async(user_id, reason="Нарушение правил"):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('INSERT INTO banned_users (user_id, reason) VALUES ($1, $2) ON CONFLICT DO NOTHING', user_id, reason)
-        await conn.execute('UPDATE users SET is_allowed = FALSE, is_banned = TRUE WHERE user_id = $1', user_id)
-
-async def unban_user_async(user_id):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM banned_users WHERE user_id = $1', user_id)
-        await conn.execute('UPDATE users SET is_banned = FALSE WHERE user_id = $1', user_id)
-
-async def is_banned_async(user_id):
-    if not db_pool:
-        return False
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval('SELECT 1 FROM banned_users WHERE user_id = $1', user_id) is not None
-
-async def save_access_request_async(user_id, username):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO access_requests (user_id, username) 
-            VALUES ($1, $2) 
-            ON CONFLICT (user_id) DO UPDATE SET requested_at = CURRENT_TIMESTAMP
-        ''', user_id, username)
-
-async def remove_access_request_async(user_id):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM access_requests WHERE user_id = $1', user_id)
-
-async def get_access_requests_async():
-    if not db_pool:
-        return []
-    async with db_pool.acquire() as conn:
-        return await conn.fetch('SELECT * FROM access_requests ORDER BY requested_at DESC')
-
-async def get_allowed_users_async():
-    if not db_pool:
-        return []
-    async with db_pool.acquire() as conn:
-        return await conn.fetch('SELECT user_id, username FROM users WHERE is_allowed = TRUE AND is_banned = FALSE')
-
-async def save_link_async(code, owner_id, max_uses=MAX_USES):
-    if not db_pool:
-        return
-    expires_at = datetime.now() + timedelta(minutes=10)
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO links (code, owner_id, max_uses, expires_at)
-            VALUES ($1, $2, $3, $4)
-        ''', code, owner_id, max_uses, expires_at)
-    print(f"✅ Ссылка {code} сохранена")
-
-async def get_link_async(code):
-    if not db_pool:
-        return None
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow('SELECT * FROM links WHERE code = $1', code)
-
-async def delete_link_async(code):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM links WHERE code = $1', code)
-
-async def update_link_uses_async(code, uses):
-    if not db_pool:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute('UPDATE links SET uses = $1 WHERE code = $2', uses, code)
-
-# Синхронные обёртки
 def get_user(user_id):
-    return run_async(get_user_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = cur.fetchone()
+    conn.close()
+    return dict(user) if user else None
 
 def add_user(user_id, username):
-    run_async(add_user_async(user_id, username))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO users (user_id, username) 
+        VALUES (?, ?) 
+        ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
+    ''', (user_id, username))
+    conn.commit()
+    conn.close()
 
 def allow_user(user_id):
-    run_async(allow_user_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET is_allowed = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 def deny_user(user_id):
-    run_async(deny_user_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET is_allowed = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
-def ban_user(user_id, reason=""):
-    run_async(ban_user_async(user_id, reason))
+def ban_user(user_id, reason="Нарушение правил"):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('INSERT OR IGNORE INTO banned_users (user_id, reason) VALUES (?, ?)', (user_id, reason))
+    cur.execute('UPDATE users SET is_allowed = 0, is_banned = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 def unban_user(user_id):
-    run_async(unban_user_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM banned_users WHERE user_id = ?', (user_id,))
+    cur.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 def is_banned(user_id):
-    return run_async(is_banned_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM banned_users WHERE user_id = ?', (user_id,))
+    banned = cur.fetchone() is not None
+    conn.close()
+    return banned
 
 def save_access_request(user_id, username):
-    run_async(save_access_request_async(user_id, username))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO access_requests (user_id, username) 
+        VALUES (?, ?) 
+        ON CONFLICT(user_id) DO UPDATE SET requested_at = CURRENT_TIMESTAMP
+    ''', (user_id, username))
+    conn.commit()
+    conn.close()
 
 def remove_access_request(user_id):
-    run_async(remove_access_request_async(user_id))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM access_requests WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 def get_access_requests():
-    return run_async(get_access_requests_async())
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM access_requests ORDER BY requested_at DESC')
+    requests = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return requests
 
 def get_allowed_users():
-    return run_async(get_allowed_users_async())
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute('SELECT user_id, username FROM users WHERE is_allowed = 1 AND is_banned = 0')
+    users = [dict(u) for u in cur.fetchall()]
+    conn.close()
+    return users
 
 def save_link(code, owner_id, max_uses=MAX_USES):
-    run_async(save_link_async(code, owner_id, max_uses))
+    expires_at = (datetime.now() + timedelta(minutes=10)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO links (code, owner_id, max_uses, expires_at)
+        VALUES (?, ?, ?, ?)
+    ''', (code, owner_id, max_uses, expires_at))
+    conn.commit()
+    conn.close()
+    print(f"✅ Ссылка {code} сохранена")
 
 def get_link(code):
-    return run_async(get_link_async(code))
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM links WHERE code = ?', (code,))
+    link = cur.fetchone()
+    conn.close()
+    if link:
+        link = dict(link)
+        # Проверка на истечение
+        expires_at = datetime.fromisoformat(link['expires_at'])
+        if datetime.now() > expires_at:
+            delete_link(code)
+            return None
+        return link
+    return None
 
 def delete_link(code):
-    run_async(delete_link_async(code))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM links WHERE code = ?', (code,))
+    conn.commit()
+    conn.close()
 
 def update_link_uses(code, uses):
-    run_async(update_link_uses_async(code, uses))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute('UPDATE links SET uses = ? WHERE code = ?', (uses, code))
+    conn.commit()
+    conn.close()
 
 # Инициализация БД
-DB_WORKING = run_async(init_db()) if DATABASE_URL else False
+init_db()
 
 # ========== HTML СТРАНИЦА ==========
 HTML_PAGE = '''
@@ -409,11 +374,6 @@ def receive_photo():
         print(f"❌ Ссылка не найдена")
         return jsonify({'success': False, 'error': 'not_found'}), 400
     
-    if datetime.now() > link_info['expires_at']:
-        print(f"⏰ Ссылка истекла")
-        delete_link(link_code)
-        return jsonify({'success': False, 'error': 'expired'}), 400
-    
     if link_info['uses'] >= link_info['max_uses']:
         print(f"📊 Лимит использован")
         return jsonify({'success': False, 'error': 'limit_reached'}), 400
@@ -443,7 +403,7 @@ def is_allowed(user_id):
     if is_banned(user_id):
         return False
     user = get_user(user_id)
-    return user and user['is_allowed'] if user else False
+    return user and user['is_allowed'] == 1 if user else False
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -633,25 +593,21 @@ def list_banned(message):
     if message.from_user.id != ADMIN_ID:
         return
     
-    if not DB_WORKING:
-        bot.send_message(ADMIN_ID, "📋 База данных не подключена")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM banned_users')
+    banned = [dict(b) for b in cur.fetchall()]
+    conn.close()
+    
+    if not banned:
+        bot.send_message(ADMIN_ID, "📋 Нет заблокированных пользователей")
         return
     
-    try:
-        conn = run_async(db_pool.acquire())
-        banned = run_async(conn.fetch('SELECT * FROM banned_users'))
-        run_async(db_pool.release(conn))
-        
-        if not banned:
-            bot.send_message(ADMIN_ID, "📋 Нет заблокированных пользователей")
-            return
-        
-        text = "🚫 *ЗАБЛОКИРОВАННЫЕ:*\n"
-        for b in banned:
-            text += f"• ID: `{b['user_id']}` - {b['reason']}\n"
-        bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
-    except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ Ошибка: {e}")
+    text = "🚫 *ЗАБЛОКИРОВАННЫЕ:*\n"
+    for b in banned:
+        text += f"• ID: `{b['user_id']}` - {b['reason']}\n"
+    bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
 def run_flask():
     port = int(os.environ.get('PORT', 10000))
@@ -662,7 +618,6 @@ threading.Thread(target=run_flask, daemon=True).start()
 print("="*50)
 print("✅ БОТ ЗАПУЩЕН")
 print(f"🤖 Бот: @{BOT_USERNAME}")
-print(f"🗄️ Статус БД: {'✅ РАБОТАЕТ' if DB_WORKING else '❌ НЕ РАБОТАЕТ'}")
 print("="*50)
 
 bot.polling(none_stop=True)
