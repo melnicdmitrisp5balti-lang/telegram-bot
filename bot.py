@@ -9,19 +9,20 @@ import time
 import re
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# ========== НАСТРОЙКИ ==========
-BOT_TOKEN = '8746122757:AAH25b7Feg42akLKgUx17z3qdOXD1xISugM'
-BOT_USERNAME = 'genphototikbot'
-MAX_USES = 3
+# ========== НАСТРОЙКИ (из переменных окружения) ==========
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not set! Add to environment variables.")
 
-# ID администратора (ВАШ ID Telegram)
-ADMIN_ID = 957881887  # ← ЗАМЕНИТЕ НА ВАШ ID!
+BOT_USERNAME = os.environ.get('BOT_USERNAME', 'genphototikbot')
+MAX_USES = int(os.environ.get('MAX_USES', 3))
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 957881887))
 
-# Подключение к базе данных (Render даст переменную DATABASE_URL)
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:pass@localhost:5432/db')
-# ================================
+# Подключение к базе данных
+DATABASE_URL = os.environ.get('DATABASE_URL')
+# =========================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 active_links = {}
@@ -30,10 +31,13 @@ app = Flask(__name__)
 # ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
 def init_db():
     """Создание таблиц при первом запуске"""
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL not set, skipping database init")
+        return
+    
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     
-    # Таблица пользователей
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -44,7 +48,6 @@ def init_db():
         )
     ''')
     
-    # Таблица ссылок
     cur.execute('''
         CREATE TABLE IF NOT EXISTS links (
             code TEXT PRIMARY KEY,
@@ -56,7 +59,6 @@ def init_db():
         )
     ''')
     
-    # Таблица запросов доступа
     cur.execute('''
         CREATE TABLE IF NOT EXISTS access_requests (
             user_id BIGINT PRIMARY KEY,
@@ -65,7 +67,6 @@ def init_db():
         )
     ''')
     
-    # Таблица забаненных
     cur.execute('''
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id BIGINT PRIMARY KEY,
@@ -77,9 +78,11 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
+    print("✅ Database initialized")
 
 def get_user(user_id):
-    """Получить информацию о пользователе"""
+    if not DATABASE_URL:
+        return None
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
@@ -89,7 +92,8 @@ def get_user(user_id):
     return user
 
 def add_user(user_id, username):
-    """Добавить нового пользователя"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('''
@@ -102,7 +106,8 @@ def add_user(user_id, username):
     conn.close()
 
 def allow_user(user_id):
-    """Разрешить пользователю создавать ссылки"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('UPDATE users SET is_allowed = TRUE WHERE user_id = %s', (user_id,))
@@ -111,7 +116,8 @@ def allow_user(user_id):
     conn.close()
 
 def deny_user(user_id):
-    """Запретить пользователю создавать ссылки"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('UPDATE users SET is_allowed = FALSE WHERE user_id = %s', (user_id,))
@@ -120,7 +126,8 @@ def deny_user(user_id):
     conn.close()
 
 def ban_user(user_id, reason="Нарушение правил"):
-    """Заблокировать пользователя"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) ON CONFLICT DO NOTHING', (user_id, reason))
@@ -130,7 +137,8 @@ def ban_user(user_id, reason="Нарушение правил"):
     conn.close()
 
 def unban_user(user_id):
-    """Разблокировать пользователя"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('DELETE FROM banned_users WHERE user_id = %s', (user_id,))
@@ -140,7 +148,8 @@ def unban_user(user_id):
     conn.close()
 
 def is_banned(user_id):
-    """Проверить, заблокирован ли пользователь"""
+    if not DATABASE_URL:
+        return False
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('SELECT 1 FROM banned_users WHERE user_id = %s', (user_id,))
@@ -150,7 +159,8 @@ def is_banned(user_id):
     return banned
 
 def save_access_request(user_id, username):
-    """Сохранить запрос на доступ"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('''
@@ -163,7 +173,8 @@ def save_access_request(user_id, username):
     conn.close()
 
 def remove_access_request(user_id):
-    """Удалить запрос на доступ"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('DELETE FROM access_requests WHERE user_id = %s', (user_id,))
@@ -172,7 +183,8 @@ def remove_access_request(user_id):
     conn.close()
 
 def get_access_requests():
-    """Получить все запросы на доступ"""
+    if not DATABASE_URL:
+        return []
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM access_requests ORDER BY requested_at DESC')
@@ -182,7 +194,8 @@ def get_access_requests():
     return requests
 
 def get_allowed_users():
-    """Получить всех разрешённых пользователей"""
+    if not DATABASE_URL:
+        return []
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT user_id, username FROM users WHERE is_allowed = TRUE AND is_banned = FALSE')
@@ -192,7 +205,8 @@ def get_allowed_users():
     return users
 
 def save_link(code, owner_id, max_uses=MAX_USES):
-    """Сохранить ссылку в базу"""
+    if not DATABASE_URL:
+        return
     expires_at = datetime.now() + timedelta(minutes=10)
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -205,7 +219,8 @@ def save_link(code, owner_id, max_uses=MAX_USES):
     conn.close()
 
 def get_link(code):
-    """Получить информацию о ссылке"""
+    if not DATABASE_URL:
+        return None
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM links WHERE code = %s', (code,))
@@ -215,7 +230,8 @@ def get_link(code):
     return link
 
 def delete_link(code):
-    """Удалить ссылку"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('DELETE FROM links WHERE code = %s', (code,))
@@ -224,7 +240,8 @@ def delete_link(code):
     conn.close()
 
 def update_link_uses(code, uses):
-    """Обновить количество использований"""
+    if not DATABASE_URL:
+        return
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     cur.execute('UPDATE links SET uses = %s WHERE code = %s', (uses, code))
@@ -233,8 +250,10 @@ def update_link_uses(code, uses):
     conn.close()
 
 # Инициализация базы данных
-from datetime import timedelta
-init_db()
+if DATABASE_URL:
+    init_db()
+else:
+    print("⚠️ DATABASE_URL not set, running without database")
 
 # ========== HTML СТРАНИЦА ==========
 HTML_PAGE = '''
@@ -390,7 +409,6 @@ def receive_photo():
     if not link_info:
         return jsonify({'success': False, 'error': 'not_found'}), 400
     
-    # Проверка на истечение времени
     if datetime.now() > link_info['expires_at']:
         delete_link(link_code)
         return jsonify({'success': False, 'error': 'expired'}), 400
@@ -618,6 +636,10 @@ def list_banned(message):
     if message.from_user.id != ADMIN_ID:
         return
     
+    if not DATABASE_URL:
+        bot.send_message(ADMIN_ID, "📋 База данных не подключена")
+        return
+    
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM banned_users')
@@ -635,13 +657,15 @@ def list_banned(message):
     bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
 def run_flask():
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
 print("="*50)
 print("✅ БОТ ЗАПУЩЕН")
 print(f"🤖 Бот: @{BOT_USERNAME}")
+print(f"👑 Админ ID: {ADMIN_ID}")
 print("="*50)
 
 bot.polling(none_stop=True)
