@@ -12,7 +12,7 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
 # ========== НАСТРОЙКИ ==========
-BOT_TOKEN = '8746122757:AAH25b7Feg42akLKgUx17z3qdo0XL1sUgM'
+BOT_TOKEN = '8746122757:AAH25b7Feg42akLKgUx17z3qdOXD1xISugM'
 BOT_USERNAME = 'genphototikbot'
 MAX_USES = 3
 
