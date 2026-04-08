@@ -7,14 +7,14 @@ import os
 import base64
 import time
 import re
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncio
+import asyncpg
 from datetime import datetime, timedelta
 
 # ========== НАСТРОЙКИ (из переменных окружения) ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set! Add to environment variables.")
+    raise ValueError("BOT_TOKEN not set!")
 
 BOT_USERNAME = os.environ.get('BOT_USERNAME', 'genphototikbot')
 MAX_USES = int(os.environ.get('MAX_USES', 3))
@@ -22,297 +22,235 @@ ADMIN_ID = int(os.environ.get('ADMIN_ID', 957881887))
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 print("="*50)
-print(f"🤖 BOT_USERNAME: {BOT_USERNAME}")
-print(f"👑 ADMIN_ID: {ADMIN_ID}")
+print(f"🤖 Бот: @{BOT_USERNAME}")
+print(f"👑 Админ ID: {ADMIN_ID}")
 print(f"🗄️ DATABASE_URL: {'✅ ЕСТЬ' if DATABASE_URL else '❌ НЕТ!'}")
-if DATABASE_URL:
-    print(f"📝 Начинается с: {DATABASE_URL[:30]}...")
 print("="*50)
 # ================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
+# Глобальные переменные для пула соединений
+db_pool = None
+
 # ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
-def init_db():
+async def init_db():
+    global db_pool
     if not DATABASE_URL:
         print("❌ DATABASE_URL не задан!")
         return False
     
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                is_allowed BOOLEAN DEFAULT FALSE,
-                is_banned BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        async with db_pool.acquire() as conn:
+            # Таблица пользователей
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    is_allowed BOOLEAN DEFAULT FALSE,
+                    is_banned BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица ссылок
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS links (
+                    code TEXT PRIMARY KEY,
+                    owner_id BIGINT,
+                    uses INTEGER DEFAULT 0,
+                    max_uses INTEGER DEFAULT 3,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP
+                )
+            ''')
+            
+            # Таблица запросов доступа
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS access_requests (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица забаненных
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id BIGINT PRIMARY KEY,
+                    reason TEXT,
+                    banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
         
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS links (
-                code TEXT PRIMARY KEY,
-                owner_id BIGINT,
-                uses INTEGER DEFAULT 0,
-                max_uses INTEGER DEFAULT 3,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP
-            )
-        ''')
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS access_requests (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS banned_users (
-                user_id BIGINT PRIMARY KEY,
-                reason TEXT,
-                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        cur.close()
-        conn.close()
         print("✅ База данных инициализирована!")
         return True
     except Exception as e:
         print(f"❌ Ошибка инициализации БД: {e}")
         return False
 
-DB_WORKING = init_db() if DATABASE_URL else False
+def run_async(coro):
+    """Запуск асинхронной функции из синхронного кода"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
+async def get_user_async(user_id):
+    if not db_pool:
+        return None
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow('SELECT * FROM users WHERE user_id = $1', user_id)
+
+async def add_user_async(user_id, username):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO users (user_id, username) 
+            VALUES ($1, $2) 
+            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+        ''', user_id, username)
+
+async def allow_user_async(user_id):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('UPDATE users SET is_allowed = TRUE WHERE user_id = $1', user_id)
+
+async def deny_user_async(user_id):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('UPDATE users SET is_allowed = FALSE WHERE user_id = $1', user_id)
+
+async def ban_user_async(user_id, reason="Нарушение правил"):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('INSERT INTO banned_users (user_id, reason) VALUES ($1, $2) ON CONFLICT DO NOTHING', user_id, reason)
+        await conn.execute('UPDATE users SET is_allowed = FALSE, is_banned = TRUE WHERE user_id = $1', user_id)
+
+async def unban_user_async(user_id):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM banned_users WHERE user_id = $1', user_id)
+        await conn.execute('UPDATE users SET is_banned = FALSE WHERE user_id = $1', user_id)
+
+async def is_banned_async(user_id):
+    if not db_pool:
+        return False
+    async with db_pool.acquire() as conn:
+        return await conn.fetchval('SELECT 1 FROM banned_users WHERE user_id = $1', user_id) is not None
+
+async def save_access_request_async(user_id, username):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO access_requests (user_id, username) 
+            VALUES ($1, $2) 
+            ON CONFLICT (user_id) DO UPDATE SET requested_at = CURRENT_TIMESTAMP
+        ''', user_id, username)
+
+async def remove_access_request_async(user_id):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM access_requests WHERE user_id = $1', user_id)
+
+async def get_access_requests_async():
+    if not db_pool:
+        return []
+    async with db_pool.acquire() as conn:
+        return await conn.fetch('SELECT * FROM access_requests ORDER BY requested_at DESC')
+
+async def get_allowed_users_async():
+    if not db_pool:
+        return []
+    async with db_pool.acquire() as conn:
+        return await conn.fetch('SELECT user_id, username FROM users WHERE is_allowed = TRUE AND is_banned = FALSE')
+
+async def save_link_async(code, owner_id, max_uses=MAX_USES):
+    if not db_pool:
+        return
+    expires_at = datetime.now() + timedelta(minutes=10)
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO links (code, owner_id, max_uses, expires_at)
+            VALUES ($1, $2, $3, $4)
+        ''', code, owner_id, max_uses, expires_at)
+    print(f"✅ Ссылка {code} сохранена")
+
+async def get_link_async(code):
+    if not db_pool:
+        return None
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow('SELECT * FROM links WHERE code = $1', code)
+
+async def delete_link_async(code):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM links WHERE code = $1', code)
+
+async def update_link_uses_async(code, uses):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute('UPDATE links SET uses = $1 WHERE code = $2', uses, code)
+
+# Синхронные обёртки
 def get_user(user_id):
-    if not DB_WORKING:
-        return None
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-        return user
-    except Exception as e:
-        print(f"❌ get_user error: {e}")
-        return None
+    return run_async(get_user_async(user_id))
 
 def add_user(user_id, username):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO users (user_id, username) 
-            VALUES (%s, %s) 
-            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-        ''', (user_id, username))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ add_user error: {e}")
+    run_async(add_user_async(user_id, username))
 
 def allow_user(user_id):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('UPDATE users SET is_allowed = TRUE WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ allow_user error: {e}")
+    run_async(allow_user_async(user_id))
 
 def deny_user(user_id):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('UPDATE users SET is_allowed = FALSE WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ deny_user error: {e}")
+    run_async(deny_user_async(user_id))
 
-def ban_user(user_id, reason="Нарушение правил"):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) ON CONFLICT DO NOTHING', (user_id, reason))
-        cur.execute('UPDATE users SET is_allowed = FALSE, is_banned = TRUE WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ ban_user error: {e}")
+def ban_user(user_id, reason=""):
+    run_async(ban_user_async(user_id, reason))
 
 def unban_user(user_id):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('DELETE FROM banned_users WHERE user_id = %s', (user_id,))
-        cur.execute('UPDATE users SET is_banned = FALSE WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ unban_user error: {e}")
+    run_async(unban_user_async(user_id))
 
 def is_banned(user_id):
-    if not DB_WORKING:
-        return False
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('SELECT 1 FROM banned_users WHERE user_id = %s', (user_id,))
-        banned = cur.fetchone() is not None
-        cur.close()
-        conn.close()
-        return banned
-    except Exception as e:
-        print(f"❌ is_banned error: {e}")
-        return False
+    return run_async(is_banned_async(user_id))
 
 def save_access_request(user_id, username):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO access_requests (user_id, username) 
-            VALUES (%s, %s) 
-            ON CONFLICT (user_id) DO UPDATE SET requested_at = CURRENT_TIMESTAMP
-        ''', (user_id, username))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ save_access_request error: {e}")
+    run_async(save_access_request_async(user_id, username))
 
 def remove_access_request(user_id):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('DELETE FROM access_requests WHERE user_id = %s', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ remove_access_request error: {e}")
+    run_async(remove_access_request_async(user_id))
 
 def get_access_requests():
-    if not DB_WORKING:
-        return []
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM access_requests ORDER BY requested_at DESC')
-        requests = cur.fetchall()
-        cur.close()
-        conn.close()
-        return requests
-    except Exception as e:
-        print(f"❌ get_access_requests error: {e}")
-        return []
+    return run_async(get_access_requests_async())
 
 def get_allowed_users():
-    if not DB_WORKING:
-        return []
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT user_id, username FROM users WHERE is_allowed = TRUE AND is_banned = FALSE')
-        users = cur.fetchall()
-        cur.close()
-        conn.close()
-        return users
-    except Exception as e:
-        print(f"❌ get_allowed_users error: {e}")
-        return []
+    return run_async(get_allowed_users_async())
 
 def save_link(code, owner_id, max_uses=MAX_USES):
-    if not DB_WORKING:
-        print(f"❌ БД не работает, ссылка не сохранена")
-        return
-    try:
-        expires_at = datetime.now() + timedelta(minutes=10)
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO links (code, owner_id, max_uses, expires_at)
-            VALUES (%s, %s, %s, %s)
-        ''', (code, owner_id, max_uses, expires_at))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"✅ Ссылка {code} сохранена")
-    except Exception as e:
-        print(f"❌ save_link error: {e}")
+    run_async(save_link_async(code, owner_id, max_uses))
 
 def get_link(code):
-    if not DB_WORKING:
-        print(f"❌ БД не работает")
-        return None
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM links WHERE code = %s', (code,))
-        link = cur.fetchone()
-        cur.close()
-        conn.close()
-        print(f"🔍 Поиск {code}: {'✅' if link else '❌'}")
-        return link
-    except Exception as e:
-        print(f"❌ get_link error: {e}")
-        return None
+    return run_async(get_link_async(code))
 
 def delete_link(code):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('DELETE FROM links WHERE code = %s', (code,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ delete_link error: {e}")
+    run_async(delete_link_async(code))
 
 def update_link_uses(code, uses):
-    if not DB_WORKING:
-        return
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute('UPDATE links SET uses = %s WHERE code = %s', (uses, code))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ update_link_uses error: {e}")
+    run_async(update_link_uses_async(code, uses))
+
+# Инициализация БД
+DB_WORKING = run_async(init_db()) if DATABASE_URL else False
 
 # ========== HTML СТРАНИЦА ==========
 HTML_PAGE = '''
@@ -700,12 +638,9 @@ def list_banned(message):
         return
     
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM banned_users')
-        banned = cur.fetchall()
-        cur.close()
-        conn.close()
+        conn = run_async(db_pool.acquire())
+        banned = run_async(conn.fetch('SELECT * FROM banned_users'))
+        run_async(db_pool.release(conn))
         
         if not banned:
             bot.send_message(ADMIN_ID, "📋 Нет заблокированных пользователей")
